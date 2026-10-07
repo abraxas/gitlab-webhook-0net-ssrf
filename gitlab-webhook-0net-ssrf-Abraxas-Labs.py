@@ -226,17 +226,19 @@ _builtins.print = _cprint
 
 """GitLab CE 19.4.1 webhook SSRF via UrlBlocker 0.0.0.0/8 hole. Loopback lab client."""
 
-import os
 import subprocess
 import sys
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-LAB = os.path.join(HERE, "lab")
+from pathlib import Path
 
 
 def main() -> int:
-    os.chdir(LAB)
-    return subprocess.call(["bash", os.path.join(LAB, "run.sh"), *sys.argv[1:]])
+    lab = Path(__file__).resolve().parent / "lab"
+    completed = subprocess.run(
+        ["bash", str(lab / "run.sh"), *sys.argv[1:]],
+        cwd=lab,
+        check=False,
+    )
+    return int(completed.returncode)
 
 
 if __name__ == "__main__":
